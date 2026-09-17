@@ -1,26 +1,26 @@
 import io
 import zipfile
 import concurrent.futures as cf
-
+ 
 import requests
 import streamlit as st
-
+ 
 # =====================================================================
 #  Descargador de fotos desde Azure Blob (Distrinando)
 #  Replica la logica de la macro InsertarFotosDesdeAzure, pero baja
 #  TODAS las fotos de cada articulo (-1, -2, -3, -4...), sean
 #  correlativas o tengan saltos.
 # =====================================================================
-
+ 
 st.set_page_config(page_title="Descargar fotos Azure", page_icon="📷", layout="wide")
-
+ 
 # ---------------------------------------------------------------------
 #  Configuracion de marcas: prefijo -> carpeta en el blob
 #  El ORDEN importa: primero los prefijos de 3 letras (RBK, COL),
 #  despues los de 1 letra (C, K, P), igual que en la macro.
 # ---------------------------------------------------------------------
 BASE_URL = "https://distriecomm.blob.core.windows.net/catalogo/"
-
+ 
 MARCAS = [
     ("RBK", "Reebok"),
     ("COL", "Columbia"),
@@ -28,8 +28,8 @@ MARCAS = [
     ("K",   "Kappa"),
     ("P",   "Piccadilly"),
 ]
-
-
+ 
+ 
 def detectar_carpeta(codigo: str):
     """Devuelve la carpeta (marca) segun el prefijo del codigo, o None."""
     up = codigo.strip().upper()
@@ -37,12 +37,12 @@ def detectar_carpeta(codigo: str):
         if up.startswith(prefijo):
             return carpeta
     return None
-
-
+ 
+ 
 def construir_url(codigo: str, carpeta: str, n: int, ext: str) -> str:
     return f"{BASE_URL}{carpeta}/{codigo}-{n}{ext}"
-
-
+ 
+ 
 # ---------------------------------------------------------------------
 #  Descarga de una sola foto (para correr en paralelo)
 # ---------------------------------------------------------------------
@@ -65,14 +65,14 @@ def bajar_una(session: requests.Session, codigo: str, carpeta: str, n: int, exts
                     "url": url,
                 }
     return None
-
-
+ 
+ 
 def procesar(articulos, max_fotos, exts, workers):
     """Devuelve (encontrados, sin_marca, sin_fotos)."""
     encontrados = []
     sin_marca = []
     sin_fotos = []
-
+ 
     tareas = []  # (codigo, carpeta, n)
     for codigo in articulos:
         carpeta = detectar_carpeta(codigo)
@@ -81,17 +81,17 @@ def procesar(articulos, max_fotos, exts, workers):
             continue
         for n in range(1, max_fotos + 1):
             tareas.append((codigo, carpeta, n))
-
+ 
     if not tareas:
         return encontrados, sin_marca, sin_fotos
-
+ 
     session = requests.Session()
     session.headers.update({"User-Agent": "Distrinando-FotoDownloader/1.0"})
-
+ 
     progreso = st.progress(0.0, text="Buscando fotos en Azure...")
     total = len(tareas)
     hechas = 0
-
+ 
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
         futuros = {
             ex.submit(bajar_una, session, c, carp, n, exts): (c, n)
@@ -103,20 +103,20 @@ def procesar(articulos, max_fotos, exts, workers):
                 encontrados.append(res)
             hechas += 1
             progreso.progress(hechas / total, text=f"Buscando fotos... {hechas}/{total}")
-
+ 
     progreso.empty()
-
+ 
     # Articulos con marca valida pero sin ninguna foto
     con_foto = {e["codigo"] for e in encontrados}
     for codigo in articulos:
         if detectar_carpeta(codigo) is not None and codigo not in con_foto:
             sin_fotos.append(codigo)
-
+ 
     # Ordenar por codigo y numero de foto
     encontrados.sort(key=lambda e: (e["codigo"], e["n"]))
     return encontrados, sin_marca, sin_fotos
-
-
+ 
+ 
 def armar_zip(encontrados, por_carpeta: bool) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -124,8 +124,8 @@ def armar_zip(encontrados, por_carpeta: bool) -> bytes:
             ruta = f"{e['codigo']}/{e['nombre']}" if por_carpeta else e["nombre"]
             z.writestr(ruta, e["contenido"])
     return buf.getvalue()
-
-
+ 
+ 
 # =====================================================================
 #  INTERFAZ
 # =====================================================================
@@ -135,16 +135,16 @@ st.caption(
     "La app detecta la marca por el prefijo y baja TODAS las fotos "
     "(-1, -2, -3...), aunque haya saltos."
 )
-
+ 
 col_izq, col_der = st.columns([2, 1])
-
+ 
 with col_izq:
     texto = st.text_area(
         "Articulos (uno por linea)",
         height=260,
         placeholder="RBK100033738\nCOL1234ABC\nC205089\nK123456\nP987654",
     )
-
+ 
 with col_der:
     st.markdown("**Opciones**")
     max_fotos = st.slider("Maximo de fotos por articulo", 1, 30, 12)
@@ -153,9 +153,8 @@ with col_der:
         [".jpg", ".jpeg", ".png", ".webp"],
         default=[".jpg"],
     )
-    por_carpeta = st.checkbox("Agrupar el ZIP por articulo", value=True)
     workers = st.slider("Descargas en paralelo", 4, 40, 16)
-
+ 
     st.markdown("**Marcas / prefijos**")
     st.markdown(
         "- `RBK` → Reebok\n"
@@ -164,15 +163,22 @@ with col_der:
         "- `K` → Kappa\n"
         "- `P` → Piccadilly"
     )
-
+ 
+agrupacion = st.radio(
+    "¿Cómo querés el ZIP?",
+    ["Una carpeta por artículo", "Todas las fotos juntas (sin carpetas)"],
+    horizontal=True,
+)
+por_carpeta = agrupacion.startswith("Una carpeta")
+ 
 buscar = st.button("Buscar y descargar fotos", type="primary", use_container_width=True)
-
+ 
 if buscar:
     articulos = [l.strip() for l in texto.splitlines() if l.strip()]
     # Sacar duplicados conservando el orden
     vistos = set()
     articulos = [a for a in articulos if not (a in vistos or vistos.add(a))]
-
+ 
     if not articulos:
         st.warning("Pega al menos un articulo.")
     elif not exts_sel:
@@ -181,13 +187,13 @@ if buscar:
         encontrados, sin_marca, sin_fotos = procesar(
             articulos, max_fotos, exts_sel, workers
         )
-
+ 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Articulos", len(articulos))
         c2.metric("Fotos encontradas", len(encontrados))
         c3.metric("Sin fotos", len(sin_fotos))
         c4.metric("Marca no detectada", len(sin_marca))
-
+ 
         if encontrados:
             zip_bytes = armar_zip(encontrados, por_carpeta)
             st.download_button(
@@ -198,7 +204,7 @@ if buscar:
                 type="primary",
                 use_container_width=True,
             )
-
+ 
             # Resumen por articulo
             resumen = {}
             for e in encontrados:
@@ -206,15 +212,18 @@ if buscar:
             with st.expander("Detalle por articulo", expanded=True):
                 for codigo, nums in resumen.items():
                     st.write(f"**{codigo}** — {len(nums)} fotos: {sorted(nums)}")
-
+ 
             # Vista previa
             st.subheader("Vista previa")
             cols = st.columns(6)
             for i, e in enumerate(encontrados):
                 with cols[i % 6]:
                     st.image(e["contenido"], caption=e["nombre"], use_container_width=True)
-
+ 
         if sin_fotos:
             st.warning("Sin ninguna foto encontrada: " + ", ".join(sin_fotos))
         if sin_marca:
             st.error("Marca no detectada (revisar prefijo): " + ", ".join(sin_marca))
+ 
+
+
