@@ -6,21 +6,25 @@ import requests
 import streamlit as st
  
 # =====================================================================
-#  Descargador de fotos desde Azure Blob (Distrinando)
-#  Replica la logica de la macro InsertarFotosDesdeAzure, pero baja
-#  TODAS las fotos de cada articulo (-1, -2, -3, -4...), sean
-#  correlativas o tengan saltos.
+#  Descargador de fotos de producto (Distrinando)
+#
+#  Dos fuentes:
+#   1) AZURE   -> blob del catalogo interno
+#                 https://distriecomm.blob.core.windows.net/catalogo/<Marca>/<sku>-<n>.jpg
+#   2) SHOPIFY -> CDN de las tiendas online
+#                 https://<dominio>/cdn/shop/files/<sku>-<n>.jpg
+#
+#  En ambos casos: pegas un listado de SKU (uno por linea), detecta la
+#  marca por el prefijo y baja TODAS las fotos (-1, -2, -3...), sean
+#  correlativas o con saltos.
 # =====================================================================
  
-st.set_page_config(page_title="Descargar fotos Azure", page_icon="📷", layout="wide")
+st.set_page_config(page_title="Descargar fotos", page_icon="📷", layout="wide")
  
 # ---------------------------------------------------------------------
-#  Configuracion de marcas: prefijo -> carpeta en el blob
-#  El ORDEN importa: primero los prefijos de 3 letras (RBK, COL),
-#  despues los de 1 letra (C, K, P), igual que en la macro.
+#  Marcas: prefijo -> nombre. El ORDEN importa (primero los de 3
+#  letras: RBK, COL; despues los de 1: C, K, P), igual que en la macro.
 # ---------------------------------------------------------------------
-BASE_URL = "https://distriecomm.blob.core.windows.net/catalogo/"
- 
 MARCAS = [
     ("RBK", "Reebok"),
     ("COL", "Columbia"),
@@ -29,58 +33,91 @@ MARCAS = [
     ("P",   "Piccadilly"),
 ]
  
+# Carpeta en el blob de Azure por marca
+AZURE_BASE = "https://distriecomm.blob.core.windows.net/catalogo/"
+AZURE_CARPETA = {
+    "Reebok": "Reebok",
+    "Columbia": "Columbia",
+    "Crocs": "Crocs",
+    "Kappa": "Kappa",
+    "Piccadilly": "Piccadilly",
+}
  
-def detectar_carpeta(codigo: str):
-    """Devuelve la carpeta (marca) segun el prefijo del codigo, o None."""
+# Dominios de las tiendas Shopify por marca (editables en la UI).
+# Solo Crocs esta confirmado; completa los demas una vez.
+SHOPIFY_DOMINIOS_DEFAULT = {
+    "Reebok": "reebok.com.ar",
+    "Columbia": "columbiasportswear.com.ar",
+    "Crocs": "www.crocs.com.ar",
+    "Kappa": "www.kappastore.com.ar",
+    "Piccadilly": "www.piccadilly.com.ar",
+}
+ 
+# Rutas que usa Shopify para servir imagenes (se prueban en orden)
+SHOPIFY_PATHS = ["/cdn/shop/files/", "/cdn/shop/products/"]
+ 
+ 
+def detectar_marca(codigo: str):
     up = codigo.strip().upper()
-    for prefijo, carpeta in MARCAS:
+    for prefijo, marca in MARCAS:
         if up.startswith(prefijo):
-            return carpeta
+            return marca
     return None
  
  
-def construir_url(codigo: str, carpeta: str, n: int, ext: str) -> str:
-    return f"{BASE_URL}{carpeta}/{codigo}-{n}{ext}"
+def urls_candidatas(codigo, marca, n, ext, fuente, dominios):
+    """Lista de URLs posibles para la foto <codigo>-<n><ext>."""
+    if fuente == "Azure":
+        carpeta = AZURE_CARPETA.get(marca)
+        if not carpeta:
+            return []
+        return [f"{AZURE_BASE}{carpeta}/{codigo}-{n}{ext}"]
+    else:  # Shopify
+        dom = (dominios.get(marca) or "").strip().rstrip("/")
+        dom = dom.replace("https://", "").replace("http://", "")
+        if not dom:
+            return []
+        return [f"https://{dom}{path}{codigo}-{n}{ext}" for path in SHOPIFY_PATHS]
  
  
 # ---------------------------------------------------------------------
 #  Descarga de una sola foto (para correr en paralelo)
 # ---------------------------------------------------------------------
-def bajar_una(session: requests.Session, codigo: str, carpeta: str, n: int, exts):
+def bajar_una(session, codigo, marca, n, exts, fuente, dominios):
     for ext in exts:
-        url = construir_url(codigo, carpeta, n, ext)
-        try:
-            r = session.get(url, timeout=15)
-        except requests.RequestException:
-            continue
-        if r.status_code == 200 and r.content and len(r.content) > 100:
-            ct = r.headers.get("Content-Type", "")
-            # Descartar respuestas XML de error de Azure aunque den 200
-            if ct.startswith("image") or not ct.startswith(("text", "application/xml")):
-                return {
-                    "codigo": codigo,
-                    "n": n,
-                    "nombre": f"{codigo}-{n}{ext}",
-                    "contenido": r.content,
-                    "url": url,
-                }
+        for url in urls_candidatas(codigo, marca, n, ext, fuente, dominios):
+            try:
+                r = session.get(url, timeout=20)
+            except requests.RequestException:
+                continue
+            if r.status_code == 200 and r.content and len(r.content) > 100:
+                ct = r.headers.get("Content-Type", "")
+                if ct.startswith("image") or not ct.startswith(("text", "application/xml", "application/json")):
+                    return {
+                        "codigo": codigo,
+                        "n": n,
+                        "nombre": f"{codigo}-{n}{ext}",
+                        "contenido": r.content,
+                        "url": url,
+                    }
     return None
  
  
-def procesar(articulos, max_fotos, exts, workers):
-    """Devuelve (encontrados, sin_marca, sin_fotos)."""
-    encontrados = []
-    sin_marca = []
-    sin_fotos = []
+def procesar(articulos, max_fotos, exts, workers, fuente, dominios):
+    encontrados, sin_marca, sin_fotos = [], [], []
  
-    tareas = []  # (codigo, carpeta, n)
+    tareas = []
     for codigo in articulos:
-        carpeta = detectar_carpeta(codigo)
-        if carpeta is None:
+        marca = detectar_marca(codigo)
+        if marca is None:
+            sin_marca.append(codigo)
+            continue
+        # Si es Shopify y no hay dominio cargado para esa marca -> sin_marca
+        if fuente == "Shopify" and not (dominios.get(marca) or "").strip():
             sin_marca.append(codigo)
             continue
         for n in range(1, max_fotos + 1):
-            tareas.append((codigo, carpeta, n))
+            tareas.append((codigo, marca, n))
  
     if not tareas:
         return encontrados, sin_marca, sin_fotos
@@ -88,15 +125,15 @@ def procesar(articulos, max_fotos, exts, workers):
     session = requests.Session()
     session.headers.update({"User-Agent": "Distrinando-FotoDownloader/1.0"})
  
-    progreso = st.progress(0.0, text="Buscando fotos en Azure...")
+    progreso = st.progress(0.0, text="Buscando fotos...")
     total = len(tareas)
     hechas = 0
  
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        futuros = {
-            ex.submit(bajar_una, session, c, carp, n, exts): (c, n)
-            for (c, carp, n) in tareas
-        }
+        futuros = [
+            ex.submit(bajar_una, session, c, m, n, exts, fuente, dominios)
+            for (c, m, n) in tareas
+        ]
         for fut in cf.as_completed(futuros):
             res = fut.result()
             if res:
@@ -106,18 +143,21 @@ def procesar(articulos, max_fotos, exts, workers):
  
     progreso.empty()
  
-    # Articulos con marca valida pero sin ninguna foto
     con_foto = {e["codigo"] for e in encontrados}
     for codigo in articulos:
-        if detectar_carpeta(codigo) is not None and codigo not in con_foto:
+        marca = detectar_marca(codigo)
+        if marca is None:
+            continue
+        if fuente == "Shopify" and not (dominios.get(marca) or "").strip():
+            continue
+        if codigo not in con_foto:
             sin_fotos.append(codigo)
  
-    # Ordenar por codigo y numero de foto
     encontrados.sort(key=lambda e: (e["codigo"], e["n"]))
     return encontrados, sin_marca, sin_fotos
  
  
-def armar_zip(encontrados, por_carpeta: bool) -> bytes:
+def armar_zip(encontrados, por_carpeta):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for e in encontrados:
@@ -129,25 +169,36 @@ def armar_zip(encontrados, por_carpeta: bool) -> bytes:
 # =====================================================================
 #  INTERFAZ
 # =====================================================================
-st.title("📷 Descargar fotos desde Azure")
+st.title("📷 Descargar fotos de producto")
+ 
+fuente = st.radio(
+    "Fuente de las fotos",
+    ["Azure", "Shopify"],
+    horizontal=True,
+    help="Azure = blob del catalogo interno. Shopify = CDN de las tiendas online.",
+)
+ 
 st.caption(
-    "Pega los articulos (SKU / modelo-color), uno por linea. "
-    "La app detecta la marca por el prefijo y baja TODAS las fotos "
-    "(-1, -2, -3...), aunque haya saltos."
+    "Pega los SKU (uno por linea). Detecta la marca por el prefijo y baja "
+    "TODAS las fotos (-1, -2, -3...), aunque haya saltos."
 )
  
 col_izq, col_der = st.columns([2, 1])
  
 with col_izq:
     texto = st.text_area(
-        "Articulos (uno por linea)",
+        "SKU (uno por linea)",
         height=260,
-        placeholder="RBK100033738\nCOL1234ABC\nC205089\nK123456\nP987654",
+        placeholder=(
+            "C10001-C5CI\nRBK100033738\nCOL1234ABC\nK123456\nP987654"
+            if fuente == "Shopify"
+            else "RBK100033738\nCOL1234ABC\nC205089\nK123456\nP987654"
+        ),
     )
  
 with col_der:
     st.markdown("**Opciones**")
-    max_fotos = st.slider("Maximo de fotos por articulo", 1, 30, 12)
+    max_fotos = st.slider("Maximo de fotos por SKU", 1, 30, 12)
     exts_sel = st.multiselect(
         "Extensiones a probar",
         [".jpg", ".jpeg", ".png", ".webp"],
@@ -155,14 +206,18 @@ with col_der:
     )
     workers = st.slider("Descargas en paralelo", 4, 40, 16)
  
-    st.markdown("**Marcas / prefijos**")
-    st.markdown(
-        "- `RBK` → Reebok\n"
-        "- `COL` → Columbia\n"
-        "- `C` → Crocs\n"
-        "- `K` → Kappa\n"
-        "- `P` → Piccadilly"
-    )
+# Dominios de tiendas (solo para Shopify)
+dominios = dict(SHOPIFY_DOMINIOS_DEFAULT)
+if fuente == "Shopify":
+    with st.expander("🌐 Dominios de las tiendas Shopify (completar una vez)", expanded=True):
+        st.caption("Solo el dominio, sin https:// (ej: www.crocs.com.ar).")
+        d1, d2, d3 = st.columns(3)
+        d4, d5, _ = st.columns(3)
+        dominios["Crocs"] = d1.text_input("Crocs (C)", value=SHOPIFY_DOMINIOS_DEFAULT["Crocs"])
+        dominios["Reebok"] = d2.text_input("Reebok (RBK)", value=SHOPIFY_DOMINIOS_DEFAULT["Reebok"], placeholder="www.reebok.com.ar")
+        dominios["Columbia"] = d3.text_input("Columbia (COL)", value=SHOPIFY_DOMINIOS_DEFAULT["Columbia"], placeholder="www.columbia.com.ar")
+        dominios["Kappa"] = d4.text_input("Kappa (K)", value=SHOPIFY_DOMINIOS_DEFAULT["Kappa"], placeholder="www.kappa.com.ar")
+        dominios["Piccadilly"] = d5.text_input("Piccadilly (P)", value=SHOPIFY_DOMINIOS_DEFAULT["Piccadilly"], placeholder="www.piccadilly.com.ar")
  
 agrupacion = st.radio(
     "¿Cómo querés el ZIP?",
@@ -171,59 +226,82 @@ agrupacion = st.radio(
 )
 por_carpeta = agrupacion.startswith("Una carpeta")
  
-buscar = st.button("Buscar y descargar fotos", type="primary", use_container_width=True)
+buscar = st.button("Buscar fotos", type="primary", use_container_width=True)
  
+# ---------------------------------------------------------------------
+#  Al buscar: procesar y guardar en session_state (el resultado y el
+#  boton de descarga sobreviven al recargar cuando se aprieta Descargar).
+# ---------------------------------------------------------------------
 if buscar:
     articulos = [l.strip() for l in texto.splitlines() if l.strip()]
-    # Sacar duplicados conservando el orden
     vistos = set()
     articulos = [a for a in articulos if not (a in vistos or vistos.add(a))]
  
     if not articulos:
-        st.warning("Pega al menos un articulo.")
+        st.warning("Pega al menos un SKU.")
+        st.session_state.pop("resultado", None)
     elif not exts_sel:
         st.warning("Elegi al menos una extension.")
+        st.session_state.pop("resultado", None)
     else:
         encontrados, sin_marca, sin_fotos = procesar(
-            articulos, max_fotos, exts_sel, workers
+            articulos, max_fotos, exts_sel, workers, fuente, dominios
+        )
+        st.session_state["resultado"] = {
+            "articulos": articulos,
+            "encontrados": encontrados,
+            "sin_marca": sin_marca,
+            "sin_fotos": sin_fotos,
+            "fuente": fuente,
+        }
+ 
+# ---------------------------------------------------------------------
+#  Mostrar el ultimo resultado guardado
+# ---------------------------------------------------------------------
+res = st.session_state.get("resultado")
+if res:
+    articulos = res["articulos"]
+    encontrados = res["encontrados"]
+    sin_marca = res["sin_marca"]
+    sin_fotos = res["sin_fotos"]
+ 
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("SKU", len(articulos))
+    c2.metric("Fotos encontradas", len(encontrados))
+    c3.metric("Sin fotos", len(sin_fotos))
+    c4.metric("Sin dominio / marca", len(sin_marca))
+ 
+    if encontrados:
+        zip_bytes = armar_zip(encontrados, por_carpeta)
+        st.success(f"✅ {len(encontrados)} fotos listas para descargar.")
+        st.download_button(
+            "⬇️ Descargar todas las fotos (.zip)",
+            data=zip_bytes,
+            file_name="fotos.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
         )
  
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Articulos", len(articulos))
-        c2.metric("Fotos encontradas", len(encontrados))
-        c3.metric("Sin fotos", len(sin_fotos))
-        c4.metric("Marca no detectada", len(sin_marca))
+        resumen = {}
+        for e in encontrados:
+            resumen.setdefault(e["codigo"], []).append(e["n"])
+        with st.expander("Detalle por SKU", expanded=True):
+            for codigo, nums in resumen.items():
+                st.write(f"**{codigo}** — {len(nums)} fotos: {sorted(nums)}")
  
-        if encontrados:
-            zip_bytes = armar_zip(encontrados, por_carpeta)
-            st.download_button(
-                "⬇️ Descargar todas las fotos (.zip)",
-                data=zip_bytes,
-                file_name="fotos_azure.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
-            )
+        st.subheader("Vista previa")
+        cols = st.columns(6)
+        for i, e in enumerate(encontrados):
+            with cols[i % 6]:
+                st.image(e["contenido"], caption=e["nombre"], use_container_width=True)
  
-            # Resumen por articulo
-            resumen = {}
-            for e in encontrados:
-                resumen.setdefault(e["codigo"], []).append(e["n"])
-            with st.expander("Detalle por articulo", expanded=True):
-                for codigo, nums in resumen.items():
-                    st.write(f"**{codigo}** — {len(nums)} fotos: {sorted(nums)}")
+    if sin_fotos:
+        st.warning("Sin ninguna foto encontrada: " + ", ".join(sin_fotos))
+    if sin_marca:
+        st.error(
+            "Sin dominio cargado o marca no detectada (revisar prefijo/dominio): "
+            + ", ".join(sin_marca)
+        )
  
-            # Vista previa
-            st.subheader("Vista previa")
-            cols = st.columns(6)
-            for i, e in enumerate(encontrados):
-                with cols[i % 6]:
-                    st.image(e["contenido"], caption=e["nombre"], use_container_width=True)
- 
-        if sin_fotos:
-            st.warning("Sin ninguna foto encontrada: " + ", ".join(sin_fotos))
-        if sin_marca:
-            st.error("Marca no detectada (revisar prefijo): " + ", ".join(sin_marca))
- 
-
 
